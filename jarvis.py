@@ -40,7 +40,7 @@ except Exception:
 # ----------------------------------------------------------------------------
 # Never paste the key here - put it in the .env file (see .env.example)
 API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("DEEPSEEK_API_KEY", "")
-MODEL = "openai/gpt-oss-20b"            # Smarter but slower: "openai/gpt-oss-120b"
+MODEL = "openai/gpt-oss-120b"           # Faster but less smart: "openai/gpt-oss-20b"
 BASE_URL = "https://api.groq.com/openai/v1"
 MAX_TOOL_STEPS = 6                      # how many tool calls Jarvis may chain for one request
 SPEAK_REPLIES = True                                # False = text only
@@ -89,15 +89,22 @@ except Exception:
     detect = None
 
 OS = platform.system()  # Windows / Darwin / Linux
+HOME = os.path.expanduser("~")
 
 SYSTEM_PROMPT = f"""You are JARVIS, a smart, polite personal assistant running on the user's computer ({OS}).
 Always reply in the SAME language the user wrote in (English, Urdu, Hindi, Chinese, Russian or Arabic).
-Today is {{today}}.
+Today is {{today}}. The user's home folder is {HOME}.
 
 You have tools to control the computer and to get live information. Use them whenever they help.
 
 Rules:
 - For anything about news, prices, scores, sports, current events or anything that may have changed, use web_search first.
+- If no other tool fits the task (maths, renaming or sorting many files, Excel/CSV/PDF work, image resizing,
+  checking something on the system...), write a short Python script and run it with run_python.
+  Print the result at the end of the script. Prefer the standard library.
+- For files, look first (list_files / find_files) so you use real paths, then act.
+- Never delete files unless the user clearly asked for it.
+- If a tool fails, read the error, fix the problem and try again once before giving up.
 - Never claim you did something unless you called the tool for it.
 - Keep replies short and natural because they will be spoken aloud. No markdown, tables or long lists.
 """
@@ -133,6 +140,25 @@ TOOLS = [
          {"text": {"type": "string"}}, ["text"]),
     tool("run_command", "Run a shell command. The user is asked to confirm first.",
          {"command": {"type": "string"}}, ["command"]),
+    tool("run_python", "Write and run a Python script on this computer and get its printed output. "
+                       "The user is asked to confirm first.",
+         {"code": {"type": "string", "description": "Full Python script. Use print() for results."}},
+         ["code"]),
+    tool("list_files", "List the files and folders inside a folder.",
+         {"folder": {"type": "string",
+                     "description": "Folder path, or a name like Desktop, Downloads, Documents"}},
+         ["folder"]),
+    tool("find_files", "Search for files by name inside a folder and all its subfolders.",
+         {"name": {"type": "string", "description": "Part of the file name, e.g. 'resume' or '.pdf'"},
+          "folder": {"type": "string", "description": "Where to search. Default: the home folder"}},
+         ["name"]),
+    tool("read_file", "Read a text file (txt, py, csv, json, md, html...).",
+         {"path": {"type": "string"}}, ["path"]),
+    tool("write_file", "Create or overwrite a text file. Asks the user before overwriting.",
+         {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
+    tool("move_file", "Move or rename a file or folder. The user is asked to confirm first.",
+         {"source": {"type": "string"}, "destination": {"type": "string"}},
+         ["source", "destination"]),
 ]
 
 client = None
@@ -239,16 +265,139 @@ def tool_type_text(text):
     return "Typed the text."
 
 
+def confirm(title, message):
+    """Ask the user Yes/No. The UI replaces this with a popup window."""
+    print(f"\n  {title}:\n{message}")
+    return input("  Allow? (y/n): ").strip().lower() == "y"
+
+
 def tool_run_command(command):
-    print(f"\n  JARVIS wants to run this command:\n    {command}")
-    ok = input("  Allow? (y/n): ").strip().lower()
-    if ok != "y":
+    if not confirm("JARVIS wants to run this command", command):
         return "User denied the command."
     try:
         r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
         return (r.stdout + r.stderr).strip()[:2000] or "Done (no output)."
     except Exception as e:
         return f"Command failed: {e}"
+
+
+def tool_run_python(code):
+    shown = code if len(code) < 1500 else code[:1500] + "\n..."
+    if not confirm("JARVIS wants to run this Python code", shown):
+        return "User denied running the code."
+    path = os.path.join(tempfile.gettempdir(), "jarvis_task.py")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(code)
+    try:
+        # same Python as Jarvis, so everything installed in the venv is available
+        r = subprocess.run([sys.executable, path], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=120, cwd=HOME)
+        out = (r.stdout + r.stderr).strip()
+        return out[-4000:] or "Done (no output)."
+    except subprocess.TimeoutExpired:
+        return "The script took longer than 2 minutes and was stopped."
+    except Exception as e:
+        return f"Could not run the code: {e}"
+
+
+# ----------------------------------------------------------------------------
+# FILES
+# ----------------------------------------------------------------------------
+SPECIAL_FOLDERS = ("desktop", "downloads", "documents", "pictures", "music", "videos")
+SKIP_DIRS = {"venv", ".venv", "node_modules", "__pycache__", "AppData", "$Recycle.Bin", ".git"}
+
+
+def resolve_path(p):
+    """Turn 'Downloads', '~/x' or a relative path into a full path."""
+    p = os.path.expandvars(os.path.expanduser((p or "").strip().strip('"')))
+    if not p:
+        return HOME
+    if os.path.isabs(p):
+        return p
+    first = p.replace("\\", "/").split("/")[0].lower()
+    if first in SPECIAL_FOLDERS:
+        # on many Windows PCs Desktop/Documents live inside OneDrive
+        onedrive = os.path.join(HOME, "OneDrive", p)
+        if not os.path.exists(os.path.join(HOME, p)) and os.path.exists(onedrive):
+            return onedrive
+    return os.path.join(HOME, p)
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def tool_list_files(folder):
+    path = resolve_path(folder)
+    try:
+        entries = sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower()))
+    except Exception as e:
+        return f"Could not open {path}: {e}"
+    lines = [f"{path} ({len(entries)} items)"]
+    for e in entries[:200]:
+        try:
+            lines.append(f"[folder] {e.name}" if e.is_dir()
+                         else f"{e.name}  ({human_size(e.stat().st_size)})")
+        except OSError:
+            lines.append(e.name)
+    if len(entries) > 200:
+        lines.append(f"... and {len(entries) - 200} more")
+    return "\n".join(lines)
+
+
+def tool_find_files(name, folder=""):
+    root = resolve_path(folder)
+    needle = name.lower()
+    found, start = [], time.time()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for f in filenames:
+            if needle in f.lower():
+                found.append(os.path.join(dirpath, f))
+                if len(found) >= 50:
+                    return "\n".join(found) + "\n(stopped at 50 results)"
+        if time.time() - start > 20:
+            break
+    return "\n".join(found) if found else f"No files matching '{name}' in {root}."
+
+
+def tool_read_file(path):
+    path = resolve_path(path)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read(20001)
+    except Exception as e:
+        return f"Could not read {path}: {e}"
+    return text[:20000] + ("\n... (file is longer, only the start is shown)" if len(text) > 20000 else "")
+
+
+def tool_write_file(path, content):
+    path = resolve_path(path)
+    if os.path.exists(path) and not confirm("JARVIS wants to overwrite a file", path):
+        return "User did not allow overwriting the file."
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Saved {path}"
+    except Exception as e:
+        return f"Could not write {path}: {e}"
+
+
+def tool_move_file(source, destination):
+    src, dst = resolve_path(source), resolve_path(destination)
+    if not os.path.exists(src):
+        return f"{src} does not exist."
+    if not confirm("JARVIS wants to move a file", f"From: {src}\nTo:   {dst}"):
+        return "User did not allow the move."
+    try:
+        return f"Moved to {shutil.move(src, dst)}"
+    except Exception as e:
+        return f"Could not move: {e}"
 
 
 def run_tool(action, args):
@@ -273,6 +422,18 @@ def run_tool(action, args):
         return tool_type_text(args.get("text", ""))
     if action == "run_command":
         return tool_run_command(args.get("command", ""))
+    if action == "run_python":
+        return tool_run_python(args.get("code", ""))
+    if action == "list_files":
+        return tool_list_files(args.get("folder", ""))
+    if action == "find_files":
+        return tool_find_files(args.get("name", ""), args.get("folder", ""))
+    if action == "read_file":
+        return tool_read_file(args.get("path", ""))
+    if action == "write_file":
+        return tool_write_file(args.get("path", ""), args.get("content", ""))
+    if action == "move_file":
+        return tool_move_file(args.get("source", ""), args.get("destination", ""))
     return None
 
 

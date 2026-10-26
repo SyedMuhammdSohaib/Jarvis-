@@ -11,7 +11,6 @@ import math
 import time
 import queue
 import threading
-import subprocess
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -94,8 +93,8 @@ class JarvisApp(ctk.CTk):
             on_voice=lambda g, s: self.q.put(("voice", g, s)),
             confirm=self.ask_confirm,
         )
-        # run_command asks through a popup window instead of the console
-        jarvis.tool_run_command = self.confirm_and_run
+        # commands, Python code and file changes ask through a popup instead of the console
+        jarvis.confirm = self.ask_confirm
 
         self.build_ui()
         self.add_message("jarvis", "Jarvis online. Type below, tap a shortcut, "
@@ -413,17 +412,6 @@ class JarvisApp(ctk.CTk):
         self.q.put(("confirm", title, message, done, holder))
         done.wait()
         return holder.get("ok", False)
-
-    def confirm_and_run(self, command):
-        """Replacement for jarvis.tool_run_command: asks with a popup."""
-        if not self.ask_confirm("Jarvis wants to run a command",
-                                f"Allow this command?\n\n{command}"):
-            return "User denied the command."
-        try:
-            r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
-            return (r.stdout + r.stderr).strip()[:2000] or "Done (no output)."
-        except Exception as e:
-            return f"Command failed: {e}"
 
     # ------------------------------------------------- thread -> UI bridge
     def poll(self):

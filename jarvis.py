@@ -1,5 +1,5 @@
 """
-JARVIS - a personal desktop assistant powered by the DeepSeek R1 API.
+JARVIS - a personal desktop assistant powered by an AI model on Groq.
 
 Features
   * Chat in English, Urdu, Hindi, Chinese, Russian, Arabic (type or speak)
@@ -26,14 +26,23 @@ import webbrowser
 import urllib.parse
 import urllib.request
 
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
+
+# load GROQ_API_KEY from a .env file next to this script (if python-dotenv is installed)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except Exception:
+    pass
 
 # ----------------------------------------------------------------------------
 # SETTINGS  (you can edit these)
 # ----------------------------------------------------------------------------
-API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")   # or paste key between quotes
-MODEL = "openai/gpt-oss-20b"            # DeepSeek R1. Faster: "deepseek-chat"
-BASE_URL ="https://api.groq.com/openai/v1"
+# Never paste the key here - put it in the .env file (see .env.example)
+API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("DEEPSEEK_API_KEY", "")
+MODEL = "openai/gpt-oss-20b"            # Smarter but slower: "openai/gpt-oss-120b"
+BASE_URL = "https://api.groq.com/openai/v1"
+MAX_TOOL_STEPS = 6                      # how many tool calls Jarvis may chain for one request
 SPEAK_REPLIES = True                                # False = text only
 USE_MICROPHONE = False                              # True = press Enter, then talk
 CURRENT_LANG = "en"                                 # language used for the microphone
@@ -85,28 +94,46 @@ SYSTEM_PROMPT = f"""You are JARVIS, a smart, polite personal assistant running o
 Always reply in the SAME language the user wrote in (English, Urdu, Hindi, Chinese, Russian or Arabic).
 Today is {{today}}.
 
-You MUST answer with ONE JSON object only, no other text, in this format:
-{{"action": "<name>", "args": {{...}}, "say": "<short message to the user in their language>"}}
-
-Available actions:
-- "none": just talk. args: {{}}. Put your full answer in "say".
-- "search": look up live information on the web. args: {{"query": "..."}}
-- "weather": args: {{"city": "..."}}
-- "system_info": battery/CPU/memory/time info. args: {{}}
-- "open_app": args: {{"name": "notepad" | "chrome" | "calculator" | ...}}
-- "open_url": args: {{"url": "https://..."}}
-- "web_search_open": open a Google search in the browser. args: {{"query": "..."}}
-- "screenshot": args: {{}}
-- "key": press a key. args: {{"key": "volumeup|volumedown|volumemute|playpause|nexttrack|prevtrack|enter|esc"}}
-- "type_text": type text where the cursor is. args: {{"text": "..."}}
-- "run_command": run a shell command (user will be asked to confirm). args: {{"command": "..."}}
+You have tools to control the computer and to get live information. Use them whenever they help.
 
 Rules:
-- For anything about news, prices, scores, sports, current events or anything that may have changed, use "search" first.
-- After you get search/weather/system results, give the final answer with action "none".
-- Never claim you did something unless you used the action for it.
-- Keep "say" short and natural because it will be spoken aloud.
+- For anything about news, prices, scores, sports, current events or anything that may have changed, use web_search first.
+- Never claim you did something unless you called the tool for it.
+- Keep replies short and natural because they will be spoken aloud. No markdown, tables or long lists.
 """
+
+
+def tool(name, description, params=None, required=None):
+    """Build one tool definition in the format the API expects."""
+    return {"type": "function", "function": {
+        "name": name,
+        "description": description,
+        "parameters": {"type": "object", "properties": params or {},
+                       "required": required or []},
+    }}
+
+
+TOOLS = [
+    tool("web_search", "Look up live information on the web (news, prices, scores, facts).",
+         {"query": {"type": "string"}}, ["query"]),
+    tool("weather", "Get the current weather for a city.",
+         {"city": {"type": "string"}}, ["city"]),
+    tool("system_info", "Get battery, CPU, memory and time info of this computer."),
+    tool("open_app", "Open an app on this computer.",
+         {"name": {"type": "string", "description": "e.g. notepad, chrome, calculator"}}, ["name"]),
+    tool("open_url", "Open a website in the browser.",
+         {"url": {"type": "string"}}, ["url"]),
+    tool("google_search", "Open a Google search in the browser for the user to see.",
+         {"query": {"type": "string"}}, ["query"]),
+    tool("screenshot", "Take a screenshot and save it to the Pictures folder."),
+    tool("press_key", "Press a media or keyboard key, e.g. to change the volume.",
+         {"key": {"type": "string", "enum": ["volumeup", "volumedown", "volumemute", "playpause",
+                                             "nexttrack", "prevtrack", "enter", "esc"]}}, ["key"]),
+    tool("type_text", "Type text where the cursor is.",
+         {"text": {"type": "string"}}, ["text"]),
+    tool("run_command", "Run a shell command. The user is asked to confirm first.",
+         {"command": {"type": "string"}}, ["command"]),
+]
 
 client = None
 history = []
@@ -225,7 +252,7 @@ def tool_run_command(command):
 
 
 def run_tool(action, args):
-    if action == "search":
+    if action == "web_search":
         return tool_search(args.get("query", ""))
     if action == "weather":
         return tool_weather(args.get("city", ""))
@@ -235,12 +262,12 @@ def run_tool(action, args):
         return tool_open_app(args.get("name", ""))
     if action == "open_url":
         return tool_open_url(args.get("url", ""))
-    if action == "web_search_open":
+    if action == "google_search":
         return tool_open_url("https://www.google.com/search?q=" +
                              urllib.parse.quote(args.get("query", "")))
     if action == "screenshot":
         return tool_screenshot()
-    if action == "key":
+    if action == "press_key":
         return tool_key(args.get("key", ""))
     if action == "type_text":
         return tool_type_text(args.get("text", ""))
@@ -250,56 +277,65 @@ def run_tool(action, args):
 
 
 # ----------------------------------------------------------------------------
-# BRAIN (DeepSeek R1)
+# BRAIN (uses the API's built-in tool calling)
 # ----------------------------------------------------------------------------
-def parse_json(text):
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
-    text = re.sub(r"```(?:json)?", "", text).strip()
-    m = re.search(r"\{.*\}", text, re.S)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            pass
-    return {"action": "none", "args": {}, "say": text}
-
-
 def ask_model(messages):
     system = SYSTEM_PROMPT.replace("{today}", datetime.datetime.now().strftime("%A, %d %B %Y, %H:%M"))
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": system}] + messages,
-    )
-    return resp.choices[0].message.content or ""
+    # gpt-oss models answer faster when asked to think less
+    extra = {"reasoning_effort": "low"} if "gpt-oss" in MODEL else None
+    for attempt in range(2):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "system", "content": system}] + messages,
+                tools=TOOLS,
+                extra_body=extra,
+            )
+            return resp.choices[0].message
+        except BadRequestError as e:
+            # Groq rejects a badly formed tool call with "tool_use_failed"; one retry usually fixes it
+            if attempt == 0 and "tool_use_failed" in str(e):
+                continue
+            raise
+
+
+def recent_history(limit=30):
+    """Last messages of the chat, always starting at a user message so tool replies stay paired."""
+    start = max(0, len(history) - limit)
+    while start > 0 and history[start]["role"] != "user":
+        start -= 1
+    return history[start:]
 
 
 def think(user_text):
     history.append({"role": "user", "content": user_text})
-    final_say = ""
-    for _ in range(4):  # allow a few tool steps
-        raw = ask_model(history[-20:])
-        data = parse_json(raw)
-        action = data.get("action", "none")
-        args = data.get("args", {}) or {}
-        say = data.get("say", "")
-        history.append({"role": "assistant", "content": raw})
+    for _ in range(MAX_TOOL_STEPS):
+        msg = ask_model(recent_history())
 
-        if action == "none":
-            final_say = say
-            break
+        if not msg.tool_calls:
+            reply = re.sub(r"<think>.*?</think>", "", msg.content or "", flags=re.S).strip()
+            history.append({"role": "assistant", "content": reply})
+            return reply or "Sorry, I could not finish that."
 
-        print(f"  [{action}] {args}")
-        result = run_tool(action, args)
-        if action in ("search", "weather", "system_info"):
-            history.append({"role": "user",
-                            "content": f"TOOL RESULT for {action}:\n{result}\n"
-                                       f"Now answer the original question with action \"none\"."})
-            continue
-        final_say = say or result
-        if result and result not in final_say:
-            print(f"  -> {result}")
-        break
-    return final_say or "Sorry, I could not finish that."
+        history.append({"role": "assistant", "content": msg.content or "", "tool_calls": [
+            {"id": c.id, "type": "function",
+             "function": {"name": c.function.name, "arguments": c.function.arguments}}
+            for c in msg.tool_calls]})
+
+        for call in msg.tool_calls:
+            name = call.function.name
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+            print(f"  [{name}] {args}")
+            result = run_tool(name, args)
+            if result is None:
+                result = f"Unknown tool: {name}"
+            history.append({"role": "tool", "tool_call_id": call.id, "content": str(result)})
+    return "Sorry, I could not finish that."
 
 
 # ----------------------------------------------------------------------------
@@ -368,7 +404,7 @@ Or just type anything in any language. Example requests:
 def main():
     global client, API_KEY, SPEAK_REPLIES, USE_MICROPHONE, CURRENT_LANG
     if not API_KEY:
-        API_KEY = input("Paste your DeepSeek API key: ").strip()
+        API_KEY = input("Paste your Groq API key: ").strip()
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
     print("=" * 60)

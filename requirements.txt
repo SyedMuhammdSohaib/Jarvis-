@@ -1,0 +1,18 @@
+# brain
+openai
+python-dotenv
+
+# desktop window
+customtkinter
+
+# tools
+ddgs
+pyautogui
+psutil
+
+# voice
+edge-tts
+pygame
+SpeechRecognition
+pyaudio
+langdetect

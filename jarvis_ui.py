@@ -4,7 +4,7 @@ JARVIS UI - modern desktop window for jarvis.py
 Run:   python jarvis_ui.py
 Needs: pip install customtkinter
 Keep jarvis.py, jarvis_extras.py and this file in the SAME folder.
-(your API key, MODEL and BASE_URL are still set inside jarvis.py)
+(MODEL and BASE_URL are set inside jarvis.py, the API key goes in the .env file)
 """
 
 import math

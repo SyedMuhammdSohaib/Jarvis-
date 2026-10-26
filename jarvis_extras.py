@@ -19,7 +19,6 @@ import time
 import queue
 import asyncio
 import threading
-import datetime
 import platform
 import tempfile
 import subprocess
@@ -27,9 +26,8 @@ import webbrowser
 import urllib.parse
 import urllib.request
 
-from openai import BadRequestError
-
 import jarvis
+from jarvis import tool
 
 OS = platform.system()
 
@@ -193,19 +191,25 @@ def run_extra(action, args):
     return None
 
 
+EXTRA_TOOLS = [
+    tool("play_youtube", "Play a song or video on YouTube.",
+         {"query": {"type": "string", "description": "song or video name"}}, ["query"]),
+    tool("lock_pc", "Lock the computer."),
+    tool("screen_off", "Turn the monitor off."),
+    tool("power", "Restart or shut down the computer (the user is asked to confirm), or cancel it.",
+         {"mode": {"type": "string", "enum": ["restart", "shutdown", "cancel"]}}, ["mode"]),
+    tool("set_theme", "Change the app look.",
+         {"name": {"type": "string", "enum": ["blue", "ironman", "matrix"]}}, ["name"]),
+    tool("set_voice", "Change Jarvis's voice. Leave a field empty to keep it as it is.",
+         {"gender": {"type": "string", "enum": ["male", "female", ""]},
+          "speed": {"type": "string", "enum": ["slow", "normal", "fast", ""]}}),
+]
+
+
 # ----------------------------------------------------------------------------
 # PROMPT ADD-ON
 # ----------------------------------------------------------------------------
 EXTRA_PROMPT = """
-
-More actions:
-- "play_youtube": play a song or video on YouTube. args: {"query": "song or video name"}
-- "lock_pc": lock the computer. args: {}
-- "screen_off": turn the monitor off. args: {}
-- "power": restart or shut down (the user is asked to confirm). args: {"mode": "restart" | "shutdown" | "cancel"}
-- "set_theme": change the app look. args: {"name": "blue" | "ironman" | "matrix"}
-- "set_voice": change Jarvis's voice. args: {"gender": "male" | "female" | "", "speed": "slow" | "normal" | "fast" | ""}
-
 Extra rules:
 - You can tell jokes, shayari/poetry and short stories in the user's language using action "none". Keep jokes clean. Stories are about 100-150 words and kid-friendly unless asked otherwise.
 - If the user writes Urdu or Hindi in English letters (Roman Urdu / Hinglish), reply in proper Urdu script (or Devanagari for Hindi) so the voice can read it correctly.
@@ -286,32 +290,11 @@ def speak(text):
 def install(on_theme=None, on_voice=None, confirm=None):
     hooks["theme"], hooks["voice"], hooks["confirm"] = on_theme, on_voice, confirm
 
-    if "More actions:" not in jarvis.SYSTEM_PROMPT:
+    if "Extra rules:" not in jarvis.SYSTEM_PROMPT:
         jarvis.SYSTEM_PROMPT = jarvis.SYSTEM_PROMPT + EXTRA_PROMPT
+        jarvis.TOOLS.extend(EXTRA_TOOLS)
 
     jarvis.speak = speak
-
-    # Faster answers: ask reasoning models (gpt-oss) to think less
-    effort = {"ok": "gpt-oss" in jarvis.MODEL}
-    original_ask = jarvis.ask_model
-
-    def ask_model(messages):
-        if not effort["ok"]:
-            return original_ask(messages)
-        system = jarvis.SYSTEM_PROMPT.replace(
-            "{today}", datetime.datetime.now().strftime("%A, %d %B %Y, %H:%M"))
-        try:
-            resp = jarvis.client.chat.completions.create(
-                model=jarvis.MODEL,
-                messages=[{"role": "system", "content": system}] + messages,
-                extra_body={"reasoning_effort": "low"},
-            )
-            return resp.choices[0].message.content or ""
-        except BadRequestError:
-            effort["ok"] = False         # this model doesn't support it; use normal call
-            return original_ask(messages)
-
-    jarvis.ask_model = ask_model
 
     original = jarvis.run_tool
 

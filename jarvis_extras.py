@@ -175,7 +175,89 @@ def set_voice(gender, speed):
     return "Voice updated: " + ", ".join(changed)
 
 
+# ----------------------------------------------------------------------------
+# WHATSAPP  (contacts are saved in whatsapp_contacts.json, which stays off GitHub)
+# ----------------------------------------------------------------------------
+CONTACTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whatsapp_contacts.json")
+
+
+def load_contacts():
+    try:
+        with open(CONTACTS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def clean_number(number):
+    """'0300-1234567' -> '923001234567' (Pakistan numbers without a country code get 92)."""
+    digits = re.sub(r"\D", "", number or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0") and len(digits) == 11:
+        digits = "92" + digits[1:]
+    return digits
+
+
+def save_contact(name, number):
+    digits = clean_number(number)
+    if len(digits) < 10:
+        return f"'{number}' does not look like a phone number."
+    contacts = load_contacts()
+    contacts[name.strip().lower()] = digits
+    with open(CONTACTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(contacts, f, ensure_ascii=False, indent=2)
+    return f"Saved {name} as +{digits}."
+
+
+def find_contact(who):
+    """Return (name, number) for a saved name or a phone number, else (None, None)."""
+    contacts = load_contacts()
+    key = (who or "").strip().lower()
+    if key in contacts:
+        return key, contacts[key]
+    matches = [n for n in contacts if key and key in n]
+    if len(matches) == 1:
+        return matches[0], contacts[matches[0]]
+    digits = clean_number(who)
+    if len(digits) >= 10:
+        return "+" + digits, digits
+    return None, None
+
+
+def whatsapp_send(contact, message):
+    name, number = find_contact(contact)
+    if not number:
+        saved = ", ".join(load_contacts()) or "none"
+        return (f"No saved contact called '{contact}'. Saved contacts: {saved}. "
+                f"Ask the user for the number and save it with whatsapp_save_contact.")
+    if not jarvis.confirm("Jarvis wants to send a WhatsApp message",
+                          f"To: {name} (+{number})\n\n{message}"):
+        return "User cancelled the message."
+
+    text = urllib.parse.quote(message)
+    try:
+        # WhatsApp Desktop app opens the chat with the message already typed
+        os.startfile(f"whatsapp://send?phone={number}&text={text}")
+        wait = 6
+    except Exception:
+        webbrowser.open(f"https://web.whatsapp.com/send?phone={number}&text={text}")
+        wait = 20  # WhatsApp Web takes longer to load
+    if jarvis.pyautogui is None:
+        return "Opened the chat with the message typed. Press Enter to send it."
+    time.sleep(wait)
+    jarvis.pyautogui.press("enter")
+    return f"Sent the message to {name}. (If it is still in the box, the chat opened slowly: press Enter.)"
+
+
 def run_extra(action, args):
+    if action == "whatsapp_send":
+        return whatsapp_send(args.get("contact", ""), args.get("message", ""))
+    if action == "whatsapp_save_contact":
+        return save_contact(args.get("name", ""), args.get("number", ""))
+    if action == "whatsapp_contacts":
+        contacts = load_contacts()
+        return "\n".join(f"{n}: +{d}" for n, d in contacts.items()) or "No saved contacts yet."
     if action == "play_youtube":
         return play_youtube(args.get("query", ""))
     if action == "lock_pc":
@@ -203,6 +285,12 @@ EXTRA_TOOLS = [
     tool("set_voice", "Change Jarvis's voice. Leave a field empty to keep it as it is.",
          {"gender": {"type": "string", "enum": ["male", "female", ""]},
           "speed": {"type": "string", "enum": ["slow", "normal", "fast", ""]}}),
+    tool("whatsapp_send", "Send a WhatsApp message. The user sees it and confirms before it is sent.",
+         {"contact": {"type": "string", "description": "Saved contact name, or a phone number"},
+          "message": {"type": "string"}}, ["contact", "message"]),
+    tool("whatsapp_save_contact", "Save a WhatsApp contact's name and phone number.",
+         {"name": {"type": "string"}, "number": {"type": "string"}}, ["name", "number"]),
+    tool("whatsapp_contacts", "List the saved WhatsApp contacts."),
 ]
 
 
@@ -211,9 +299,11 @@ EXTRA_TOOLS = [
 # ----------------------------------------------------------------------------
 EXTRA_PROMPT = """
 Extra rules:
-- You can tell jokes, shayari/poetry and short stories in the user's language using action "none". Keep jokes clean. Stories are about 100-150 words and kid-friendly unless asked otherwise.
+- You can tell jokes, shayari/poetry and short stories in the user's language as a normal reply. Keep jokes clean. Stories are about 100-150 words and kid-friendly unless asked otherwise.
 - If the user writes Urdu or Hindi in English letters (Roman Urdu / Hinglish), reply in proper Urdu script (or Devanagari for Hindi) so the voice can read it correctly.
 - Only use "power" when the user clearly asks to restart or shut down.
+- Only send WhatsApp messages the user asked for. Write the message in the language and style the user wants.
+  If a contact is not saved, ask the user for the number, save it, then send.
 """
 
 

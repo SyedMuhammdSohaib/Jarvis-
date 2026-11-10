@@ -7,6 +7,8 @@ A personal desktop assistant for Windows, with voice, a themed UI and PC control
 - Speaks replies aloud (male/female voice, slow/normal/fast)
 - Live info: web search, weather, date/time, system info
 - PC control: open apps and websites, play YouTube, screenshots, volume and media keys, typing text, lock, screen off, restart/shutdown
+- Runs Python code it writes itself, and works with files (asks you first)
+- WhatsApp: send messages to saved contacts (shows you the message first)
 - Shell commands (always asks you first)
 - Themes: Blue, Iron Man, Matrix
 
@@ -31,6 +33,7 @@ Put your Groq API key in `.env` (get it from https://console.groq.com/keys). **N
 | `jarvis_extras.py` | Extra tools (YouTube, lock, power, themes, voices) and faster speech |
 | `jarvis_ui.py` | Desktop window |
 | `jarvis_settings.json` | Your saved theme, voice and language |
+| `whatsapp_contacts.json` | Your WhatsApp contacts (created automatically, never uploaded) |
 
 ## Adding a new tool
 1. Write a function, e.g. `def tool_joke(): ...`
